@@ -1,5 +1,14 @@
+from contextlib import contextmanager
 from logging import getLogger
+from itertools import product
+import re
+import sys
+import time
+import unicodedata
+import urllib3
 
+from gensim import corpora
+import MeCab
 import torch
 from torch import nn
 from torch.distributions import constraints
@@ -10,6 +19,69 @@ from pyro.infer import SVI, JitTraceEnum_ELBO, TraceEnum_ELBO
 from pyro.optim import Adam
 
 logger = getLogger(__name__)
+
+
+@contextmanager
+def timer(msg):
+    start_time = time.time()
+    logger.info(msg)
+    yield
+    elapsed_time = time.time() - start_time
+    if elapsed_time > 60:
+        logger.info(f'done in {elapsed_time / 60:.2f} min.')
+    else:
+        logger.info(f'done in {elapsed_time:.2f} sec.')
+
+
+def urlopen(url):
+    http = urllib3.PoolManager()
+    res = http.request('GET', url)
+    words = res.data.decode('utf-8').split()
+    return words
+
+
+def make_stop_words():
+    url = 'http://svn.sourceforge.jp/svnroot/slothlib/CSharp/Version1/SlothLib/NLP/Filter/StopWord/word/'
+    url_ja = url + 'Japanese.txt'
+    url_en = url + 'English.txt'
+
+    stop_words_ja = urlopen(url_ja)
+    stop_words_en = urlopen(url_en)
+    stop_words = stop_words_ja + stop_words_en
+    stop_words += [chr(i) for i in range(12353, 12436)]  # ひらがな1文字
+    stop_words += [chr(i) + chr(j) for i, j in product(range(12353, 12436), range(12353, 12436))]  # ひらがな2文字
+
+    return set(stop_words)
+
+
+class Tokenizer:
+    def __init__(self):
+        mecab = MeCab.Tagger('-d /usr/local/mecab/lib/mecab/dic/mecab-ipadic-neologd/')
+        mecab.parse('')
+        self.mecab = mecab
+        self.parts = {'名詞', '動詞', '形容詞'}
+        self.stop_words = make_stop_words()
+
+    def extract_parts(self, text):
+        mecab = self.mecab
+        parts = self.parts
+        stop_words = self.stop_words
+        keywords = []
+        node = mecab.parseToNode(text).next
+        while node:
+            if node.feature.split(',')[0] in parts and node.surface not in stop_words:
+                keywords.append(node.surface)
+            node = node.next
+        return keywords
+
+    def tokenize(self, text):
+        text = unicodedata.normalize('NFKC', text)  # カナ全角、アルファベット半角にする
+        text = re.sub(r'https?://[\w/:%#$&?()~.=+\-…]+', '', text)  # URLを削る
+        text = re.sub(r'[0-9]+年|[0-9]+月|[0-9]+日|[0-9]+時|[0-9]+分', '', text)  # 日時を削る
+        text = re.sub(r'[!-@[-`{-~]', '', text)  # 記号 + 半角数字 を削る
+        text = text.lower()  # アルファベットを小文字にする
+
+        return self.extract_parts(text)
 
 
 class Lda(nn.Module):
@@ -82,3 +154,18 @@ class Lda(nn.Module):
             constraint=constraints.greater_than(0.5))
         with pyro.plate('documents', self.num_docs):
             pyro.sample('theta', dist.Dirichlet(theta_posterior))
+
+def lda_train(texts):
+    with timer('preprocessing...'):
+        t = Tokenizer()
+        word_list = [t.tokenize(text) for text in texts]
+        dictionary = corpora.Dictionary(word_list)
+        dictionary.filter_extremes()
+        corpus = [dictionary.doc2idx(text) for text in word_list]
+
+    with timer('LDA training...'):
+        lda = Lda(corpus=corpus,
+                id2word=dictionary,
+                num_topics=10)
+
+    return lda
